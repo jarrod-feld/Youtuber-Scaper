@@ -11,7 +11,11 @@ import subprocess
 import tempfile
 import logging
 import time
-import imageio_ffmpeg  # Import imageio_ffmpeg for FFmpeg handling
+import imageio_ffmpeg
+import arxiv
+import requests
+from pdfminer.high_level import extract_text  # Or use PyMuPDF as per your preference
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,7 +30,7 @@ if not GOOGLE_APPLICATION_CREDENTIALS:
     raise ValueError("No Google Application Credentials provided. Please set the GOOGLE_APPLICATION_CREDENTIALS environment variable in .env file.")
 
 # Define the system message
-SYSTEM_MESSAGE = "Marv is a factual chatbot that give looks maxxing advice. Marv is a realist who gives the harsh truth but is never pesimistic."
+SYSTEM_MESSAGE = "Marv is a factual chatbot that gives look-maxxing advice. Marv is a realist who gives the harsh truth but is never pessimistic."
 
 # Configure logging
 logging.basicConfig(
@@ -62,10 +66,7 @@ except subprocess.CalledProcessError:
     raise
 
 def get_channel_id(channel_url):
-    """
-    Extracts the channel ID from a YouTube channel URL.
-    Supports URLs in different formats.
-    """
+    # (Existing implementation)
     parsed_url = urlparse(channel_url)
     path_segments = parsed_url.path.strip('/').split('/')
 
@@ -85,9 +86,7 @@ def get_channel_id(channel_url):
         raise ValueError("Unsupported YouTube channel URL format.")
 
 def get_channel_id_from_username(username):
-    """
-    Retrieves the channel ID using the YouTube username.
-    """
+    # (Existing implementation)
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.channels().list(
         part="id",
@@ -100,9 +99,7 @@ def get_channel_id_from_username(username):
     return items[0]['id']
 
 def get_channel_id_from_custom_url(custom_name):
-    """
-    Retrieves the channel ID using the custom URL name.
-    """
+    # (Existing implementation)
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.search().list(
         part="snippet",
@@ -117,9 +114,7 @@ def get_channel_id_from_custom_url(custom_name):
     return items[0]['snippet']['channelId']
 
 def get_uploads_playlist_id(channel_id):
-    """
-    Retrieves the uploads playlist ID for the given channel ID.
-    """
+    # (Existing implementation)
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.channels().list(
         part="contentDetails",
@@ -133,9 +128,7 @@ def get_uploads_playlist_id(channel_id):
     return uploads_playlist_id
 
 def get_all_videos_from_playlist(playlist_id):
-    """
-    Fetches all video IDs and titles from the specified playlist.
-    """
+    # (Existing implementation)
     youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     video_ids = []
     video_titles = []
@@ -163,37 +156,36 @@ def get_all_videos_from_playlist(playlist_id):
     return video_ids, video_titles
 
 def download_audio(video_id):
-    """
-    Downloads the audio of a YouTube video and returns the file path.
-    Saves audio to a persistent directory.
-    Note: Downloading YouTube videos may violate YouTube's Terms of Service.
-    Ensure you have the rights and permissions to download and process the video.
-    """
+    # (Existing implementation with added logging for the command)
     download_dir = "downloaded_audios"
     os.makedirs(download_dir, exist_ok=True)  # Create the directory if it doesn't exist
     audio_file = os.path.join(download_dir, f"{video_id}.wav")  # Save each audio file with its video ID
 
+    command = [
+        "yt-dlp",
+        "-f", "bestaudio",
+        "--extract-audio",
+        "--audio-format", "wav",
+        "--ffmpeg-location", FFMPEG_PATH,  # Specify FFmpeg path
+        "-o", audio_file,  # Output file path
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+
+    logging.info(f"Executing command: {' '.join(command)}")
+
     try:
-        logging.info(f"Starting download for video ID: {video_id}")
-        subprocess.run([
-            "yt-dlp",
-            "-f", "bestaudio",
-            "--extract-audio",
-            "--audio-format", "wav",
-            "--ffmpeg-location", FFMPEG_PATH,  # Specify FFmpeg path
-            "-o", audio_file,  # Output file path
-            f"https://www.youtube.com/watch?v={video_id}"
-        ], check=True)
+        subprocess.run(command, check=True)
         logging.info(f"Successfully downloaded audio for video ID: {video_id}")
         return audio_file
     except subprocess.CalledProcessError as e:
         logging.error(f"Error downloading audio for video ID {video_id}: {e}")
         return None
+    except FileNotFoundError as e:
+        logging.error(f"Command not found: {e}")
+        return None
 
 def transcribe_audio(audio_path):
-    """
-    Transcribes the audio file using Google Cloud Speech-to-Text API.
-    """
+    # (Existing implementation)
     client = speech.SpeechClient()
 
     with io.open(audio_path, "rb") as audio_file:
@@ -222,11 +214,7 @@ def transcribe_audio(audio_path):
     return transcript.strip()
 
 def fetch_transcript(video_id):
-    """
-    Attempts to fetch the transcript using YouTubeTranscriptApi.
-    If unavailable, downloads the audio and transcribes it using Speech-to-Text.
-    Returns the transcript as a string.
-    """
+    # (Updated to include deletion after transcription)
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         transcript = "\n".join([entry['text'] for entry in transcript_list])
@@ -246,11 +234,8 @@ def fetch_transcript(video_id):
         return f"An error occurred: {str(e)}"
 
 def save_transcripts_to_jsonl(video_titles, transcripts, filename="fine_tuning_data.jsonl"):
-    """
-    Saves the transcripts to a JSONL file with 'messages' field.
-    Each JSON object contains a list of messages with roles.
-    """
-    with open(filename, 'w', encoding='utf-8') as file:
+    # (Existing implementation)
+    with open(filename, 'a', encoding='utf-8') as file:
         for title, transcript in zip(video_titles, transcripts):
             # Construct the messages list
             messages = [
@@ -266,11 +251,7 @@ def save_transcripts_to_jsonl(video_titles, transcripts, filename="fine_tuning_d
     logging.info(f"Fine-tuning data has been saved to {filename}")
 
 def read_channel_links(file_path="channellink.txt"):
-    """
-    Reads multiple YouTube channel and playlist URLs from a text file.
-    Returns two lists: channel_urls and playlist_urls.
-    Playlist URLs should be prefixed with 'playlist:' in the file.
-    """
+    # (Existing implementation)
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"The file '{file_path}' does not exist.")
 
@@ -296,14 +277,150 @@ def read_channel_links(file_path="channellink.txt"):
     return channel_urls, playlist_urls
 
 def delete_audio_file(audio_path):
-    """
-    Deletes the specified audio file to save disk space.
-    """
+    # (Existing implementation)
     try:
         os.remove(audio_path)
         logging.info(f"Deleted audio file: {audio_path}")
     except OSError as e:
         logging.warning(f"Failed to delete audio file {audio_path}: {e}")
+
+# ---------- Research Papers Integration ----------
+
+def search_arxiv(query, max_results=10):
+    """
+    Searches arXiv for papers matching the query.
+    """
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.Relevance
+    )
+    papers = []
+    for result in search.results():
+        paper = {
+            'id': result.get_short_id(),
+            'title': result.title,
+            'authors': [author.name for author in result.authors],
+            'abstract': result.summary,
+            'pdf_url': result.pdf_url
+        }
+        papers.append(paper)
+    return papers
+
+def download_pdf(pdf_url, save_path):
+    """
+    Downloads the PDF from the given URL.
+    """
+    try:
+        response = requests.get(pdf_url)
+        response.raise_for_status()  # Check for HTTP errors
+        with open(save_path, 'wb') as f:
+            f.write(response.content)
+        logging.info(f"Downloaded PDF from {pdf_url} to {save_path}")
+        return save_path
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to download PDF from {pdf_url}: {e}")
+        return None
+
+def extract_text_from_pdf(pdf_path):
+    """
+    Extracts text from the PDF using pdfminer.six.
+    """
+    try:
+        text = extract_text(pdf_path)
+        logging.info(f"Extracted text from {pdf_path}")
+        return text
+    except Exception as e:
+        logging.error(f"Failed to extract text from {pdf_path}: {e}")
+        return None
+
+def clean_text(text):
+    """
+    Cleans the extracted text.
+    """
+    text = re.sub(r'\n+', '\n', text)  # Replace multiple newlines with single newline
+    text = re.sub(r'\s+', ' ', text)   # Replace multiple spaces with single space
+    text = text.strip()
+    return text
+
+def segment_text(text, max_length=2000):
+    """
+    Segments text into chunks of max_length characters.
+    """
+    segments = []
+    while len(text) > max_length:
+        # Find the last newline within max_length
+        split_pos = text.rfind('\n', 0, max_length)
+        if split_pos == -1:
+            split_pos = max_length
+        segments.append(text[:split_pos].strip())
+        text = text[split_pos:].strip()
+    if text:
+        segments.append(text)
+    return segments
+
+def create_jsonl_entry(system_message, user_content, assistant_content):
+    """
+    Creates a JSONL entry.
+    """
+    entry = {
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content}
+        ]
+    }
+    return json.dumps(entry, ensure_ascii=False)
+
+def append_to_jsonl(filename, entries):
+    """
+    Appends a list of JSON strings to the JSONL file.
+    """
+    with open(filename, 'a', encoding='utf-8') as file:
+        for entry in entries:
+            file.write(entry + '\n')
+    logging.info(f"Appended {len(entries)} entries to {filename}")
+
+# ---------- Main Execution ----------
+
+def process_research_papers(query, max_results=5, jsonl_filename="fine_tuning_data.jsonl"):
+    """
+    Searches, downloads, extracts, processes, and appends research papers to JSONL.
+    """
+    papers = search_arxiv(query, max_results)
+    jsonl_entries = []
+
+    for paper in papers:
+        print(f"Processing research paper: {paper['title']}")
+        pdf_path = os.path.join("research_papers_pdfs", f"{paper['id']}.pdf")
+        os.makedirs("research_papers_pdfs", exist_ok=True)
+
+        downloaded_pdf = download_pdf(paper['pdf_url'], pdf_path)
+        if not downloaded_pdf:
+            continue
+
+        extracted_text = extract_text_from_pdf(downloaded_pdf)
+        if not extracted_text:
+            continue
+
+        cleaned_text = clean_text(extracted_text)
+        segments = segment_text(cleaned_text)
+
+        for segment in segments:
+            user_content = f"Research Paper Title: {paper['title']}"
+            assistant_content = segment
+            jsonl_entry = create_jsonl_entry(SYSTEM_MESSAGE, user_content, assistant_content)
+            jsonl_entries.append(jsonl_entry)
+
+        # Optionally, delete the PDF after extraction to save space
+        try:
+            os.remove(downloaded_pdf)
+            logging.info(f"Deleted PDF file: {downloaded_pdf}")
+        except OSError as e:
+            logging.warning(f"Failed to delete PDF file {downloaded_pdf}: {e}")
+
+    append_to_jsonl(jsonl_filename, jsonl_entries)
+    print(f"Appended {len(jsonl_entries)} research paper entries to {jsonl_filename}")
 
 if __name__ == "__main__":
     try:
@@ -356,6 +473,14 @@ if __name__ == "__main__":
 
         print("\nSaving all transcripts to JSONL file...")
         save_transcripts_to_jsonl(all_video_titles, transcripts)
+
+        # ---------- Process Research Papers ----------
+        # Define your research paper query here
+        research_query = "machine learning"  # Example query
+        max_research_papers = 5  # Adjust as needed
+
+        print("\nProcessing research papers...")
+        process_research_papers(research_query, max_research_papers)
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
