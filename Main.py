@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import logging
 import time
+import imageio_ffmpeg  # Import imageio_ffmpeg for FFmpeg handling
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,6 +35,31 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+# Get the path to the FFmpeg executable provided by imageio_ffmpeg
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+# Check if FFmpeg executable exists
+if not os.path.isfile(FFMPEG_PATH):
+    logging.critical(f"FFmpeg executable not found at {FFMPEG_PATH}")
+    raise FileNotFoundError(f"FFmpeg executable not found at {FFMPEG_PATH}")
+else:
+    logging.info(f"FFmpeg is available at: {FFMPEG_PATH}")
+    print(f"FFmpeg is available at: {FFMPEG_PATH}")
+
+# Set pydub's FFmpeg path
+AudioSegment.converter = FFMPEG_PATH
+
+# Also set the environment variable for FFmpeg
+os.environ["FFMPEG_BINARY"] = FFMPEG_PATH
+
+# Verify FFmpeg is working
+try:
+    subprocess.run([FFMPEG_PATH, '-version'], check=True, capture_output=True, text=True)
+    print("FFmpeg is working correctly.")
+except subprocess.CalledProcessError:
+    print("FFmpeg executable is not working.")
+    raise
 
 def get_channel_id(channel_url):
     """
@@ -139,24 +165,30 @@ def get_all_videos_from_playlist(playlist_id):
 def download_audio(video_id):
     """
     Downloads the audio of a YouTube video and returns the file path.
+    Saves audio to a persistent directory.
     Note: Downloading YouTube videos may violate YouTube's Terms of Service.
     Ensure you have the rights and permissions to download and process the video.
     """
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        audio_file = os.path.join(tmpdirname, "audio.wav")
-        try:
-            subprocess.run([
-                "yt-dlp",
-                "-f", "bestaudio",
-                "--extract-audio",
-                "--audio-format", "wav",
-                "-o", audio_file,
-                f"https://www.youtube.com/watch?v={video_id}"
-            ], check=True)
-            return audio_file
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Error downloading audio for video ID {video_id}: {e}")
-            return None
+    download_dir = "downloaded_audios"
+    os.makedirs(download_dir, exist_ok=True)  # Create the directory if it doesn't exist
+    audio_file = os.path.join(download_dir, f"{video_id}.wav")  # Save each audio file with its video ID
+
+    try:
+        logging.info(f"Starting download for video ID: {video_id}")
+        subprocess.run([
+            "yt-dlp",
+            "-f", "bestaudio",
+            "--extract-audio",
+            "--audio-format", "wav",
+            "--ffmpeg-location", FFMPEG_PATH,  # Specify FFmpeg path
+            "-o", audio_file,  # Output file path
+            f"https://www.youtube.com/watch?v={video_id}"
+        ], check=True)
+        logging.info(f"Successfully downloaded audio for video ID: {video_id}")
+        return audio_file
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error downloading audio for video ID {video_id}: {e}")
+        return None
 
 def transcribe_audio(audio_path):
     """
@@ -205,6 +237,7 @@ def fetch_transcript(video_id):
         audio_path = download_audio(video_id)
         if audio_path:
             transcript = transcribe_audio(audio_path)
+            delete_audio_file(audio_path)  # Delete after transcription
             return transcript
         else:
             return "Failed to download audio for transcription."
@@ -262,6 +295,16 @@ def read_channel_links(file_path="channellink.txt"):
 
     return channel_urls, playlist_urls
 
+def delete_audio_file(audio_path):
+    """
+    Deletes the specified audio file to save disk space.
+    """
+    try:
+        os.remove(audio_path)
+        logging.info(f"Deleted audio file: {audio_path}")
+    except OSError as e:
+        logging.warning(f"Failed to delete audio file {audio_path}: {e}")
+
 if __name__ == "__main__":
     try:
         print("Reading channel and playlist URLs from 'channellink.txt'...")
@@ -300,9 +343,14 @@ if __name__ == "__main__":
         print("Fetching transcripts for all videos...\n")
         transcripts = []
         for idx, (video_id, title) in enumerate(zip(all_video_ids, all_video_titles), start=1):
-            print(f"Fetching transcript for Video {idx}/{len(all_video_ids)}: {title}")
-            transcript = fetch_transcript(video_id)
-            transcripts.append(transcript)
+            try:
+                print(f"Fetching transcript for Video {idx}/{len(all_video_ids)}: {title}")
+                transcript = fetch_transcript(video_id)
+                transcripts.append(transcript)
+            except Exception as e:
+                print(f"Failed to process video {video_id}: {str(e)}")
+                logging.error(f"Failed to process video {video_id}: {e}")
+                transcripts.append("Failed to process transcript.")
             # Optional: Introduce a short delay to respect API rate limits
             time.sleep(0.5)  # Pause for 0.5 seconds between requests
 
