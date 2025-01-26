@@ -2,19 +2,38 @@ import os
 import json
 import googleapiclient.discovery
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from dotenv import load_dotenv
+from pydub import AudioSegment
+from google.cloud import speech
+import io
+import subprocess
+import tempfile
+import logging
+import time
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Fetch API key from environment variable
-API_KEY = os.getenv("YOUTUBE_API_KEY")
-if not API_KEY:
-    raise ValueError("No API key provided. Please set the YOUTUBE_API_KEY environment variable in .env file.")
+# Fetch API keys from environment variables
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+if not YOUTUBE_API_KEY:
+    raise ValueError("No YouTube API key provided. Please set the YOUTUBE_API_KEY environment variable in .env file.")
+if not GOOGLE_APPLICATION_CREDENTIALS:
+    raise ValueError("No Google Application Credentials provided. Please set the GOOGLE_APPLICATION_CREDENTIALS environment variable in .env file.")
 
 # Define the system message
-SYSTEM_MESSAGE = "Marv is a factual chatbot that is also sarcastic."
+SYSTEM_MESSAGE = "Marv is a factual chatbot that give looks maxxing advice. Marv is a realist who gives the harsh truth but is never pesimistic."
+
+# Configure logging
+logging.basicConfig(
+    filename='transcript_extraction.log',
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
 def get_channel_id(channel_url):
     """
@@ -43,7 +62,7 @@ def get_channel_id_from_username(username):
     """
     Retrieves the channel ID using the YouTube username.
     """
-    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.channels().list(
         part="id",
         forUsername=username
@@ -58,7 +77,7 @@ def get_channel_id_from_custom_url(custom_name):
     """
     Retrieves the channel ID using the custom URL name.
     """
-    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.search().list(
         part="snippet",
         q=custom_name,
@@ -75,7 +94,7 @@ def get_uploads_playlist_id(channel_id):
     """
     Retrieves the uploads playlist ID for the given channel ID.
     """
-    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     request = youtube.channels().list(
         part="contentDetails",
         id=channel_id
@@ -91,7 +110,7 @@ def get_all_videos_from_playlist(playlist_id):
     """
     Fetches all video IDs and titles from the specified playlist.
     """
-    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=API_KEY)
+    youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
     video_ids = []
     video_titles = []
     next_page_token = None
@@ -117,20 +136,80 @@ def get_all_videos_from_playlist(playlist_id):
 
     return video_ids, video_titles
 
+def download_audio(video_id):
+    """
+    Downloads the audio of a YouTube video and returns the file path.
+    Note: Downloading YouTube videos may violate YouTube's Terms of Service.
+    Ensure you have the rights and permissions to download and process the video.
+    """
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        audio_file = os.path.join(tmpdirname, "audio.wav")
+        try:
+            subprocess.run([
+                "yt-dlp",
+                "-f", "bestaudio",
+                "--extract-audio",
+                "--audio-format", "wav",
+                "-o", audio_file,
+                f"https://www.youtube.com/watch?v={video_id}"
+            ], check=True)
+            return audio_file
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error downloading audio for video ID {video_id}: {e}")
+            return None
+
+def transcribe_audio(audio_path):
+    """
+    Transcribes the audio file using Google Cloud Speech-to-Text API.
+    """
+    client = speech.SpeechClient()
+
+    with io.open(audio_path, "rb") as audio_file:
+        content = audio_file.read()
+
+    audio = speech.RecognitionAudio(content=content)
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        # Adjust sample_rate_hertz based on the audio file
+        sample_rate_hertz=16000,
+        language_code="en-US",
+    )
+
+    try:
+        response = client.recognize(config=config, audio=audio)
+    except Exception as e:
+        logging.error(f"Error during transcription: {e}")
+        return "Failed to transcribe transcript."
+
+    # Concatenate the transcript of all results
+    transcript = ""
+    for result in response.results:
+        transcript += result.alternatives[0].transcript + " "
+
+    return transcript.strip()
+
 def fetch_transcript(video_id):
     """
-    Fetches the transcript for a given video ID.
-    Returns the transcript as a string or a message if unavailable.
+    Attempts to fetch the transcript using YouTubeTranscriptApi.
+    If unavailable, downloads the audio and transcribes it using Speech-to-Text.
+    Returns the transcript as a string.
     """
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
         transcript = "\n".join([entry['text'] for entry in transcript_list])
+        logging.info(f"Successfully fetched transcript for video ID: {video_id}")
         return transcript
-    except TranscriptsDisabled:
-        return "Transcripts are disabled for this video."
-    except NoTranscriptFound:
-        return "No transcript available for this video."
+    except (TranscriptsDisabled, NoTranscriptFound):
+        logging.warning(f"Transcripts are disabled or not available for video ID: {video_id}. Attempting automated transcription.")
+        audio_path = download_audio(video_id)
+        if audio_path:
+            transcript = transcribe_audio(audio_path)
+            return transcript
+        else:
+            return "Failed to download audio for transcription."
     except Exception as e:
+        logging.error(f"An unexpected error occurred for video ID {video_id}: {e}")
         return f"An error occurred: {str(e)}"
 
 def save_transcripts_to_jsonl(video_titles, transcripts, filename="fine_tuning_data.jsonl"):
@@ -144,18 +223,20 @@ def save_transcripts_to_jsonl(video_titles, transcripts, filename="fine_tuning_d
             messages = [
                 {"role": "system", "content": SYSTEM_MESSAGE},
                 {"role": "user", "content": f"Video Title: {title}"},
-                {"role": "assistant", "content": transcript.strip()}
+                {"role": "assistant", "content": transcript}
             ]
             # Create the JSON object
             json_object = {"messages": messages}
             # Write the JSON object as a single line
             file.write(json.dumps(json_object, ensure_ascii=False) + "\n")
     print(f"Fine-tuning data has been saved to {filename}")
+    logging.info(f"Fine-tuning data has been saved to {filename}")
 
-def read_channel_urls(file_path="channellink.txt"):
+def read_channel_links(file_path="channellink.txt"):
     """
-    Reads multiple YouTube channel URLs from a text file.
-    Returns a list of URLs.
+    Reads multiple YouTube channel and playlist URLs from a text file.
+    Returns two lists: channel_urls and playlist_urls.
+    Playlist URLs should be prefixed with 'playlist:' in the file.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"The file '{file_path}' does not exist.")
@@ -164,27 +245,54 @@ def read_channel_urls(file_path="channellink.txt"):
         lines = file.readlines()
 
     # Remove any leading/trailing whitespace and ignore empty lines
-    urls = [line.strip() for line in lines if line.strip()]
+    channel_urls = []
+    playlist_urls = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("playlist:"):
+            playlist_url = line[len("playlist:"):].strip()
+            playlist_urls.append(playlist_url)
+        else:
+            channel_urls.append(line)
 
-    if not urls:
-        raise ValueError(f"The file '{file_path}' is empty.")
+    if not channel_urls and not playlist_urls:
+        raise ValueError(f"The file '{file_path}' does not contain any valid URLs.")
 
-    return urls
+    return channel_urls, playlist_urls
 
 if __name__ == "__main__":
     try:
-        print("Reading channel URLs from 'channellink.txt'...")
-        channel_urls = read_channel_urls("channellink.txt")
-        print(f"Total channels to process: {len(channel_urls)}\n")
+        print("Reading channel and playlist URLs from 'channellink.txt'...")
+        channel_urls, playlist_urls = read_channel_links("channellink.txt")
+        print(f"Total channels to process: {len(channel_urls)}")
+        print(f"Total additional playlists to process: {len(playlist_urls)}\n")
 
         all_video_ids = []
         all_video_titles = []
 
+        # Process channel URLs
         for channel_url in channel_urls:
             print(f"Processing channel: {channel_url}")
             channel_id = get_channel_id(channel_url)
             uploads_playlist_id = get_uploads_playlist_id(channel_id)
             video_ids, video_titles = get_all_videos_from_playlist(uploads_playlist_id)
+            all_video_ids.extend(video_ids)
+            all_video_titles.extend(video_titles)
+            print(f"Total videos collected so far: {len(all_video_ids)}\n")
+
+        # Process additional playlist URLs (e.g., Shorts)
+        for playlist_url in playlist_urls:
+            print(f"Processing additional playlist: {playlist_url}")
+            parsed_url = urlparse(playlist_url)
+            query_params = parse_qs(parsed_url.query)
+            playlist_id = query_params.get('list', [None])[0]
+            if not playlist_id:
+                print(f"Invalid playlist URL format: {playlist_url}")
+                logging.warning(f"Invalid playlist URL format: {playlist_url}")
+                continue
+            video_ids, video_titles = get_all_videos_from_playlist(playlist_id)
             all_video_ids.extend(video_ids)
             all_video_titles.extend(video_titles)
             print(f"Total videos collected so far: {len(all_video_ids)}\n")
@@ -195,9 +303,12 @@ if __name__ == "__main__":
             print(f"Fetching transcript for Video {idx}/{len(all_video_ids)}: {title}")
             transcript = fetch_transcript(video_id)
             transcripts.append(transcript)
+            # Optional: Introduce a short delay to respect API rate limits
+            time.sleep(0.5)  # Pause for 0.5 seconds between requests
 
         print("\nSaving all transcripts to JSONL file...")
         save_transcripts_to_jsonl(all_video_titles, transcripts)
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
+        logging.error(f"Script terminated due to an error: {str(e)}")
