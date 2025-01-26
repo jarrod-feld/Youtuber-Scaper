@@ -1,10 +1,20 @@
 import os
+import json
 import googleapiclient.discovery
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
+from dotenv import load_dotenv
 
-# Replace with your actual API key
-API_KEY = "AIzaSyAjz0cKEoMxaTbu0Lq4-JYOcpMkeiiFwgM"
+# Load environment variables from .env file
+load_dotenv()
+
+# Fetch API key from environment variable
+API_KEY = os.getenv("YOUTUBE_API_KEY")
+if not API_KEY:
+    raise ValueError("No API key provided. Please set the YOUTUBE_API_KEY environment variable in .env file.")
+
+# Define the system message
+SYSTEM_MESSAGE = "Marv is a factual chatbot that is also sarcastic."
 
 def get_channel_id(channel_url):
     """
@@ -123,19 +133,29 @@ def fetch_transcript(video_id):
     except Exception as e:
         return f"An error occurred: {str(e)}"
 
-def save_transcripts_to_txt(video_titles, transcripts, filename="channel_transcripts.txt"):
+def save_transcripts_to_jsonl(video_titles, transcripts, filename="fine_tuning_data.jsonl"):
     """
-    Saves the transcripts to a text file with video titles as headers.
+    Saves the transcripts to a JSONL file with 'messages' field.
+    Each JSON object contains a list of messages with roles.
     """
     with open(filename, 'w', encoding='utf-8') as file:
         for title, transcript in zip(video_titles, transcripts):
-            file.write(f"=== {title} ===\n")
-            file.write(transcript + "\n\n")
-    print(f"Transcripts have been saved to {filename}")
+            # Construct the messages list
+            messages = [
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": f"Video Title: {title}"},
+                {"role": "assistant", "content": transcript.strip()}
+            ]
+            # Create the JSON object
+            json_object = {"messages": messages}
+            # Write the JSON object as a single line
+            file.write(json.dumps(json_object, ensure_ascii=False) + "\n")
+    print(f"Fine-tuning data has been saved to {filename}")
 
-def read_channel_url(file_path="channellink.txt"):
+def read_channel_urls(file_path="channellink.txt"):
     """
-    Reads the YouTube channel URL from a text file.
+    Reads multiple YouTube channel URLs from a text file.
+    Returns a list of URLs.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"The file '{file_path}' does not exist.")
@@ -149,35 +169,35 @@ def read_channel_url(file_path="channellink.txt"):
     if not urls:
         raise ValueError(f"The file '{file_path}' is empty.")
 
-    # For this script, we'll consider only the first URL
-    return urls[0]
+    return urls
 
 if __name__ == "__main__":
     try:
-        print("Reading channel URL from 'channellink.txt'...")
-        channel_url = read_channel_url("channellink.txt")
-        print(f"Channel URL: {channel_url}\n")
+        print("Reading channel URLs from 'channellink.txt'...")
+        channel_urls = read_channel_urls("channellink.txt")
+        print(f"Total channels to process: {len(channel_urls)}\n")
 
-        print("Extracting channel ID from URL...")
-        channel_id = get_channel_id(channel_url)
-        print(f"Channel ID: {channel_id}\n")
+        all_video_ids = []
+        all_video_titles = []
 
-        print("Retrieving uploads playlist ID...")
-        uploads_playlist_id = get_uploads_playlist_id(channel_id)
-        print(f"Uploads Playlist ID: {uploads_playlist_id}\n")
+        for channel_url in channel_urls:
+            print(f"Processing channel: {channel_url}")
+            channel_id = get_channel_id(channel_url)
+            uploads_playlist_id = get_uploads_playlist_id(channel_id)
+            video_ids, video_titles = get_all_videos_from_playlist(uploads_playlist_id)
+            all_video_ids.extend(video_ids)
+            all_video_titles.extend(video_titles)
+            print(f"Total videos collected so far: {len(all_video_ids)}\n")
 
-        print("Fetching all videos from the uploads playlist...")
-        video_ids, video_titles = get_all_videos_from_playlist(uploads_playlist_id)
-        print(f"Total videos found: {len(video_ids)}\n")
-
+        print("Fetching transcripts for all videos...\n")
         transcripts = []
-        for idx, (video_id, title) in enumerate(zip(video_ids, video_titles), start=1):
-            print(f"Fetching transcript for Video {idx}/{len(video_ids)}: {title}")
+        for idx, (video_id, title) in enumerate(zip(all_video_ids, all_video_titles), start=1):
+            print(f"Fetching transcript for Video {idx}/{len(all_video_ids)}: {title}")
             transcript = fetch_transcript(video_id)
             transcripts.append(transcript)
 
-        print("\nSaving transcripts to text file...")
-        save_transcripts_to_txt(video_titles, transcripts)
+        print("\nSaving all transcripts to JSONL file...")
+        save_transcripts_to_jsonl(all_video_titles, transcripts)
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
